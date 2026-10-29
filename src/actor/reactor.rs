@@ -1828,21 +1828,30 @@ impl Reactor {
             Event::WindowFrameChanged(wid, new_frame, last_seen, requested, mouse_state) => {
                 let mission_control_active = self.is_mission_control_active();
                 let mut effective_mouse_state = mouse_state;
-                if matches!(
-                    window_workflow::classify_window_frame_change(
-                        &mut self.state,
-                        &self.transaction_manager,
-                        &mut self.drag_manager,
-                        wid,
-                        new_frame,
-                        last_seen,
-                        requested.0,
-                        &mut effective_mouse_state,
-                        mission_control_active,
-                    ),
-                    window_workflow::FrameChangeDisposition::Handled
+                let layout_retryable = self.layout_frame_retryable(wid);
+                let outcome = match window_workflow::classify_window_frame_change(
+                    &mut self.state,
+                    &self.transaction_manager,
+                    &mut self.drag_manager,
+                    wid,
+                    new_frame,
+                    last_seen,
+                    requested.0,
+                    &mut effective_mouse_state,
+                    mission_control_active,
+                    layout_retryable,
                 ) {
-                    let mut outcome = EventOutcome::no_change();
+                    window_workflow::FrameChangeDisposition::Handled => {
+                        Some(EventOutcome::no_change())
+                    }
+                    window_workflow::FrameChangeDisposition::RetryLayout => Some(
+                        EventOutcome::no_change()
+                            .with_arrange_passes(1)
+                            .with_arrange_space_scope(self.assigned_space_for_window_id(wid)),
+                    ),
+                    window_workflow::FrameChangeDisposition::NeedsGeometryAnalysis => None,
+                };
+                if let Some(mut outcome) = outcome {
                     outcome.dispatch_mouse_up = effective_mouse_state
                         == Some(crate::sys::event::MouseState::Up)
                         && self.drag_manager.actor.is_active();
@@ -4560,6 +4569,15 @@ impl Reactor {
     fn hidden_assigned_space_for_window_id(&self, wid: WindowId) -> Option<SpaceId> {
         let window = self.state.windows.window(wid)?;
         self.hidden_assigned_space_for_frame(window.info.sys_id, &window.frame_monotonic)
+    }
+
+    /// Whether an arrange would write this window's layout frame right now. Parked
+    /// windows are excluded because their target is derived from their own frame.
+    fn layout_frame_retryable(&self, wid: WindowId) -> bool {
+        !self.refreshes_blocked()
+            && self.assigned_space_for_window_id(wid).is_some_and(|space| {
+                self.is_space_active(space) && !self.window_in_non_active_workspace(space, wid)
+            })
     }
 
     fn assigned_space_for_window_id(&self, wid: WindowId) -> Option<SpaceId> {
