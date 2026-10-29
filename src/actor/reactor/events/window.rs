@@ -188,6 +188,8 @@ pub struct WindowFrameChangedPayload {
 
 pub enum FrameChangeDisposition {
     Handled,
+    /// Rift's own write was answered with another frame; re-apply the layout.
+    RetryLayout,
     NeedsGeometryAnalysis,
 }
 
@@ -201,6 +203,7 @@ pub fn classify_window_frame_change(
     requested: bool,
     mouse_state: &mut Option<MouseState>,
     mission_control_active: bool,
+    layout_retryable: bool,
 ) -> FrameChangeDisposition {
     let Some(window) = state.windows.window(wid) else {
         query_mouse_for_active_drag(drag, mouse_state);
@@ -228,11 +231,23 @@ pub fn classify_window_frame_change(
         if *mouse_state == Some(MouseState::Down) {
             transactions.clear_target_for_window(server);
         } else {
-            if new_frame.same_as(target) {
-                transactions.clear_target_for_window(server);
-            }
             if let Some(window) = state.windows.window_mut(wid) {
                 window.frame_monotonic = new_frame;
+            }
+            if new_frame.same_as(target) {
+                transactions.clear_target_for_window(server);
+                transactions.forget_rejected_target(server);
+                return FrameChangeDisposition::Handled;
+            }
+            // Bounded so apps that cannot take the frame (size limits, resize
+            // increments) are accepted instead of fought; the kept target then
+            // stops later arranges from re-sending it.
+            if layout_retryable
+                && !drag.actor.is_active()
+                && transactions.retry_rejected_target(server, target)
+            {
+                transactions.clear_target_for_window(server);
+                return FrameChangeDisposition::RetryLayout;
             }
             return FrameChangeDisposition::Handled;
         }

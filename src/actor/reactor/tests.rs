@@ -1813,7 +1813,7 @@ fn geometry_cross_display_frame_change_waits_for_authoritative_membership() {
 
 #[test]
 fn matching_rift_frame_clears_pending_target() {
-    let (mut reactor, wid, wsid, _space1, _space2, frame) = reactor_with_window_on_space1();
+    let (mut reactor, wid, wsid, space1, _space2, frame) = reactor_with_window_on_space1();
     let target_frame = CGRect::new(
         CGPoint::new(frame.origin.x + 40.0, frame.origin.y + 25.0),
         frame.size,
@@ -1844,7 +1844,7 @@ fn matching_rift_frame_clears_pending_target() {
             .same_as(target_frame)
     );
 
-    // AX may adjust a requested frame; cache the accepted geometry but keep the target pending.
+    // A different answer to the current transaction is accepted and re-sent a bounded number of times.
     let adjusted_target = CGRect::new(CGPoint::new(80.0, 40.0), frame.size);
     let accepted = CGRect::new(CGPoint::new(81.0, 40.0), frame.size);
     let txid = reactor.transaction_manager.generate_next_txid(wsid);
@@ -1859,13 +1859,13 @@ fn matching_rift_frame_clears_pending_target() {
         ))
         .unwrap();
     assert!(reactor.state.windows.window(wid).unwrap().frame_monotonic.same_as(accepted));
-    assert_eq!(
-        reactor.transaction_manager.get_target_frame(wsid),
-        Some(adjusted_target)
-    );
-    assert!(outcome.arrange.passes == 0 && !outcome.refresh_layout_mode);
+    assert_eq!(reactor.transaction_manager.get_target_frame(wsid), None);
+    assert!(outcome.arrange.passes == 1 && !outcome.refresh_layout_mode);
+    assert_eq!(outcome.arrange.space_scope, Some(space1));
 
     // A user drag beginning during the transaction clears it instead of accepting it blindly.
+    let txid = reactor.transaction_manager.generate_next_txid(wsid);
+    reactor.transaction_manager.store_txid(wsid, txid, adjusted_target);
     reactor.handle_event(Event::WindowFrameChanged(
         wid,
         accepted,
@@ -1874,6 +1874,159 @@ fn matching_rift_frame_clears_pending_target() {
         Some(MouseState::Down),
     ));
     assert_eq!(reactor.transaction_manager.get_target_frame(wsid), None);
+}
+
+#[test]
+fn rejected_rift_frame_is_kept_when_no_retry_can_be_sent() {
+    for case in ["drag", "parked", "blocked"] {
+        let (mut reactor, wid, wsid, space1, _space2, frame) = reactor_with_window_on_space1();
+        match case {
+            "drag" => reactor.drag_manager.actor.begin_native(
+                crate::actor::drag::DragSource {
+                    window: wid,
+                    origin_frame: frame,
+                    last_frame: frame,
+                    origin_space: Some(space1),
+                    current_space: Some(space1),
+                    tiled: true,
+                },
+                crate::actor::drag::DragScene::default(),
+            ),
+            "parked" => {
+                let other = reactor.test_workspace(space1, 1);
+                reactor
+                    .layout_manager
+                    .layout_engine
+                    .workspaces_mut()
+                    .set_active_workspace(space1, other);
+            }
+            _ => reactor.space_state.authoritative = false,
+        }
+        let target = CGRect::new(CGPoint::new(80.0, 40.0), frame.size);
+        let answered = CGRect::new(CGPoint::new(81.0, 40.0), frame.size);
+        let txid = reactor.transaction_manager.generate_next_txid(wsid);
+        reactor.transaction_manager.store_txid(wsid, txid, target);
+
+        let outcome = reactor
+            .dispatch_workflow(Event::WindowFrameChanged(
+                wid,
+                answered,
+                Some(txid),
+                Requested(true),
+                Some(MouseState::Up),
+            ))
+            .unwrap();
+
+        assert_eq!(outcome.arrange.passes, 0, "{case}");
+        assert_eq!(
+            reactor.transaction_manager.get_target_frame(wsid),
+            Some(target),
+            "{case}"
+        );
+        assert!(reactor.state.windows.window(wid).unwrap().frame_monotonic.same_as(answered));
+        assert!(
+            reactor.transaction_manager.retry_rejected_target(wsid, target),
+            "{case}: the retry budget must be untouched"
+        );
+    }
+}
+
+fn frame_writes_for(requests: Vec<Request>, wid: WindowId) -> Vec<(CGRect, TransactionId)> {
+    let mut writes = Vec::new();
+    for request in requests {
+        match request {
+            Request::SetWindowFrames(frames, txid, _, _, _) => writes.extend(
+                frames.into_iter().filter(|(w, _)| *w == wid).map(|(_, frame)| (frame, txid)),
+            ),
+            Request::InteractiveFramesPending(queue) => {
+                queue.drain_with(|w, frame, _, txid, _, _, _| {
+                    if w == wid {
+                        writes.push((frame, txid));
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+    writes
+}
+
+#[test]
+fn rejected_rift_frame_is_reasserted_by_next_arrange() {
+    for requested in [true, false] {
+        let (mut apps, mut reactor) = test_context();
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(space_state_event(vec![screen], vec![Some(SpaceId::new(1))]));
+        reactor.handle_events(apps.make_app(1, make_windows(1)));
+        let wid = WindowId::new(1, 1);
+        let wsid = reactor.state.windows.window(wid).unwrap().info.sys_id.unwrap();
+
+        let (layout_frame, txid) =
+            *frame_writes_for(apps.requests(), wid).last().expect("initial layout write");
+        assert_eq!(
+            reactor.transaction_manager.get_target_frame(wsid),
+            Some(layout_frame)
+        );
+
+        let answered = CGRect::new(layout_frame.origin, CGSize::new(layout_frame.size.width, 400.));
+        apps.windows.get_mut(&wid).unwrap().frame = answered;
+        reactor.handle_event(Event::WindowFrameChanged(
+            wid,
+            answered,
+            Some(txid),
+            Requested(requested),
+            Some(MouseState::Up),
+        ));
+
+        let writes = frame_writes_for(apps.requests(), wid);
+        assert!(
+            writes.iter().any(|(frame, _)| frame.same_as(layout_frame)),
+            "the layout frame must be re-sent (requested={requested}): {writes:?}"
+        );
+        assert_eq!(
+            reactor.transaction_manager.get_target_frame(wsid),
+            Some(layout_frame)
+        );
+        assert_ne!(reactor.transaction_manager.get_last_sent_txid(wsid), txid);
+    }
+}
+
+#[test]
+fn rejected_rift_frame_retries_are_bounded() {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(SpaceId::new(1))]));
+    reactor.handle_events(apps.make_app(1, make_windows(1)));
+    let wid = WindowId::new(1, 1);
+    let wsid = reactor.state.windows.window(wid).unwrap().info.sys_id.unwrap();
+
+    let mut writes = frame_writes_for(apps.requests(), wid);
+    let layout_frame = writes.last().expect("initial layout write").0;
+    let answered = CGRect::new(layout_frame.origin, CGSize::new(layout_frame.size.width, 400.));
+    let mut layout_writes = 0;
+    for _ in 0..10 {
+        let Some(&(frame, txid)) = writes.last() else { break };
+        assert!(frame.same_as(layout_frame));
+        layout_writes += writes.len();
+        apps.windows.get_mut(&wid).unwrap().frame = answered;
+        reactor.handle_event(Event::WindowFrameChanged(
+            wid,
+            answered,
+            Some(txid),
+            Requested(true),
+            Some(MouseState::Up),
+        ));
+        writes = frame_writes_for(apps.requests(), wid);
+    }
+    assert_eq!(layout_writes, 3, "one write plus two bounded retries");
+
+    assert_eq!(
+        reactor.transaction_manager.get_target_frame(wsid),
+        Some(layout_frame)
+    );
+    assert!(reactor.state.windows.window(wid).unwrap().frame_monotonic.same_as(answered));
+    reactor.update_layout_or_warn(false, false, None);
+    assert!(frame_writes_for(apps.requests(), wid).is_empty());
 }
 
 #[test]
@@ -4984,24 +5137,12 @@ fn changed_layout_retargets_window_already_at_new_position_during_animation() {
     ));
     manager.handle_message(rx.commands.try_recv().unwrap());
     let wsid = reactor.state.windows.window(right).unwrap().info.sys_id.unwrap();
-    let txid = reactor.transaction_manager.get_last_sent_txid(wsid);
-    // An intermediate AX frame can coincide with the next layout's target.
-    reactor.handle_event(Event::WindowFrameChanged(
-        right,
-        frame(228.),
-        Some(txid),
-        Requested(true),
-        Some(MouseState::Up),
-    ));
-    assert!(
-        reactor
-            .state
-            .windows
-            .window(right)
-            .unwrap()
-            .frame_monotonic
-            .same_as(frame(228.))
+    assert_eq!(
+        reactor.transaction_manager.get_target_frame(wsid),
+        Some(frame(1284.))
     );
+    // An intermediate frame can coincide with the next layout's target.
+    reactor.state.windows.window_mut(right).unwrap().frame_monotonic = frame(228.);
     assert!(super::animation::AnimationManager::animate_layout(
         &mut reactor,
         space,
